@@ -1,4 +1,4 @@
-// Token Radar radar-2: a comps-fitted token launch radar (Node 22, standard library only).
+// Token Radar radar-3: a comps-fitted token launch radar (Node 22, standard library only).
 //
 // The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>), fits its
 // launch-pricing model on the snapshot's own live-token comparables, validates the fit with a
@@ -102,6 +102,6 @@ writeFileSync(join(out, 'dossier.json'), buildDossier(out, { text_max_bytes: TEX
 
 process.stdout.write(
   `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.early_size} early, ${radar.live_size} live set aside)\n` +
-    `token radar: fit log10(mcap) = ${radar.fit.alpha} + ${radar.fit.beta} * log10(tvl) on ${radar.fit.n} comps, R2 ${radar.fit.r2}; 5-fold CV median error ${(radar.validation.median_abs_pct_error * 100).toFixed(1)}%, ${(radar.validation.within_2x_pct * 100).toFixed(0)}% within 2x\n` +
+    `token radar: fit log10(mcap) = ${radar.fit.intercept} + ${radar.fit.coef_log_tvl} * log10(tvl) + ${radar.fit.coef_growth} * growth + ${radar.fit.coef_log_age} * log10(age+30) + category on ${radar.fit.n} comps, R2 ${radar.fit.r2}; 5-fold CV median error ${(radar.validation.median_abs_pct_error * 100).toFixed(1)}%, ${(radar.validation.within_2x_pct * 100).toFixed(0)}% within 2x\n` +
     `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (3 files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
 );

@@ -1,4 +1,4 @@
-// Token Radar's model, radar-2: a comps-fitted launch-pricing model.
+// Token Radar's model, radar-3: a comps-fitted launch-pricing model.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and adds
 // pre-token protocols below the watchlist floor: the early rows the radar exists to find. A protocol
@@ -7,21 +7,31 @@
 // ranked board.
 //
 // Implied value is fitted from the snapshot's own live-token comparables, never from a hardcoded
-// list of names:
+// list of names. radar-3 replaces radar-2's one-variable fit (log10(mcap) on log10(TVL) only,
+// R² 0.19) with a multi-variable regression on every predictive field the snapshot carries:
 //
-//   comps      = live-token protocols with a market cap and a TVL (128 of them here)
-//   fit        = log10(mcap) ~ alpha + beta * log10(tvl), least squares on the comps
-//   catAdj     = this category's median mcap/TVL over the comps' overall median, clamped [0.5, 2]
-//   growthMult = 1 + clamp(change_7d, -60, 120) / 100 * 0.5
-//   maturity   = 0.6 + min(age_days, 1095) / 1095 * 0.4   (age_days unknown: 365)
-//   implied    = max(1, round(10^(alpha + beta*log10(tvl)) * catAdj * growthMult * maturity))
+//   log10(mcap) ~ intercept + b_tvl * log10(tvl_usd)
+//                            + b_growth * growth            (change_7d / 100, clipped to [-0.6, 1.2])
+//                            + b_age * log10(age_days + 30) (age unknown: the comps' median age)
+//                            + b_cat[category]              (one dummy per category with >= 3 comps)
+//
+// The fit is ridge-regularised (lambda 3, intercept unpenalised) and Huber-robust: iterated
+// reweighting with k = 1.345 * MAD downweights the comps whose market-cap/TVL ratio is an
+// extreme outlier (this snapshot's ratios run from 0.0003 to 400, so plain least squares is
+// dragged around by a handful of names) without deleting any comp from the fit. R² is always
+// reported on ALL 128 comps, never on a trimmed subset, so it stays comparable to radar-2's 0.19.
 //
 // The fit and its validation are computed at run time from the snapshot the program reads, so the
 // numbers the dashboard shows are the numbers this snapshot's comps produce. Validation is a
 // deterministic 5-fold cross-validation over the comps (fold = index % 5 on slug order): each fold
-// is fitted on the other four and scored on its held-out protocols, and the dashboard reports the
-// median absolute percentage error and the share predicted within 2x. No protocol name is ever
-// special-cased: the same function scores every row.
+// refits the whole pipeline (category set and median age from the training fold only) and is scored
+// on its held-out protocols, and the dashboard reports the median absolute percentage error and
+// the share predicted within 2x. No protocol name is ever special-cased: the same function scores
+// every row.
+//
+// Honest limits: the market is very noisy — even with all four signals the fit explains only
+// about a quarter of the variance in log market cap, and the out-of-sample median error stays
+// near 80%. The dashboard says so. The model is a ranking signal, not a price.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -51,30 +61,26 @@ export interface ModelConstants {
   growth_weight: number;
   growth_floor: number;
   growth_cap: number;
-  maturity_floor: number;
-  maturity_range: number;
-  maturity_days: number;
-  unknown_age_days: number;
-  cat_adj_min: number;
-  cat_adj_max: number;
+  age_offset_days: number;
   cat_min_comps: number;
+  ridge_lambda: number;
+  huber_k: number;
+  huber_max_iters: number;
 }
 
 export const MODEL: ModelConstants = {
   growth_weight: 0.5,
   growth_floor: -60,
   growth_cap: 120,
-  maturity_floor: 0.6,
-  maturity_range: 0.4,
-  maturity_days: 1095,
-  unknown_age_days: 365,
-  cat_adj_min: 0.5,
-  cat_adj_max: 2.0,
+  age_offset_days: 30,
   cat_min_comps: 3,
+  ridge_lambda: 3,
+  huber_k: 1.345,
+  huber_max_iters: 25,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 200;
@@ -148,10 +154,22 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
-/** The comps fit: log10(mcap) ~ alpha + beta * log10(tvl), least squares on the live-token comps. */
+/** One category's fitted coefficient: its log10 effect and the multiplier it gives. */
+export interface CategoryCoefficient {
+  category: string;
+  n: number;
+  coef: number;
+  effect: number;
+}
+
+/** The comps fit: ridge + Huber multi-variable regression of log10(mcap) on the snapshot's fields. */
 export interface CompsFit {
-  alpha: number;
-  beta: number;
+  intercept: number;
+  coef_log_tvl: number;
+  coef_growth: number;
+  coef_log_age: number;
+  category_coefs: CategoryCoefficient[];
+  median_age_days: number;
   r2: number;
   n: number;
   overall_median_ratio: number;
@@ -240,33 +258,12 @@ export function compsOf(snapshot: Snapshot): SnapshotProtocol[] {
     .sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
 }
 
-/** Least squares log10(mcap) ~ alpha + beta * log10(tvl) over `rows`, with R squared. */
-export function fitLogLog(rows: SnapshotProtocol[]): { alpha: number; beta: number; r2: number } {
-  const xs = rows.map((p) => Math.log10(p.tvl_usd));
-  const ys = rows.map((p) => Math.log10(p.mcap_usd as number));
-  const n = rows.length;
-  const mx = xs.reduce((a, b) => a + b, 0) / n;
-  const my = ys.reduce((a, b) => a + b, 0) / n;
-  let sxy = 0;
-  let sxx = 0;
-  let syy = 0;
-  for (let i = 0; i < n; i++) {
-    sxy += (xs[i]! - mx) * (ys[i]! - my);
-    sxx += (xs[i]! - mx) * (xs[i]! - mx);
-    syy += (ys[i]! - my) * (ys[i]! - my);
-  }
-  const beta = sxx === 0 ? 0 : sxy / sxx;
-  const alpha = my - beta * mx;
-  const r2 = sxx === 0 || syy === 0 ? 0 : (sxy * sxy) / (sxx * syy);
-  return { alpha, beta, r2 };
-}
-
 function medianOf(values: number[]): number {
   const s = [...values].sort((a, b) => a - b);
   return s[Math.floor(s.length / 2)]!;
 }
 
-/** The comps' overall median mcap/TVL and each category's median, for the adjustment. */
+/** The comps' overall median mcap/TVL and each category's median, for the display table. */
 export function categoryMedians(rows: SnapshotProtocol[]): { overall: number; byCategory: Map<string, { median: number; n: number }> } {
   const overall = medianOf(rows.map((p) => (p.mcap_usd as number) / p.tvl_usd));
   const byCategory = new Map<string, { median: number; n: number }>();
@@ -281,43 +278,161 @@ export function categoryMedians(rows: SnapshotProtocol[]): { overall: number; by
   return { overall, byCategory };
 }
 
-/** The category adjustment for one protocol: its category's median ratio over the overall median. */
-export function categoryAdjustment(p: SnapshotProtocol, medians: { overall: number; byCategory: Map<string, { median: number; n: number }> }, model: ModelConstants): { adjustment: number; medianRatio: number | null } {
-  const entry = medians.byCategory.get(p.category ?? '(none)');
-  if (entry === undefined || entry.n < model.cat_min_comps) return { adjustment: 1, medianRatio: null };
-  const raw = entry.median / medians.overall;
-  return { adjustment: Math.min(model.cat_adj_max, Math.max(model.cat_adj_min, raw)), medianRatio: entry.median };
+/** The growth feature: change_7d in fractions, clipped to the model's floor/cap. */
+export function growthValue(p: SnapshotProtocol, model: ModelConstants = MODEL): number {
+  const raw = finite(p.change_7d, 0);
+  return Math.min(model.growth_cap, Math.max(model.growth_floor, raw)) / 100;
+}
+
+/** The age the model uses: the protocol's own age, or the comps' median age when unlisted. */
+export function ageForModel(p: SnapshotProtocol, asOf: string, medianAgeDays: number, model: ModelConstants = MODEL): number {
+  const age = ageDays(asOf, p.listed_at);
+  return age ?? medianAgeDays;
+}
+
+/** A fit's feature spec: the dummy categories (sorted, >= cat_min_comps) and the median age. */
+export interface FeatureSpec {
+  categories: string[];
+  medianAgeDays: number;
+}
+
+export function featureSpec(rows: SnapshotProtocol[], asOf: string, model: ModelConstants = MODEL): FeatureSpec {
+  const counts = new Map<string, number>();
+  for (const p of rows) counts.set(p.category ?? '(none)', (counts.get(p.category ?? '(none)') ?? 0) + 1);
+  const categories = [...counts.entries()]
+    .filter(([, n]) => n >= model.cat_min_comps)
+    .map(([c]) => c)
+    .sort();
+  const ages = rows.map((p) => ageDays(asOf, p.listed_at)).filter((a): a is number => a !== null);
+  return { categories, medianAgeDays: ages.length > 0 ? medianOf(ages) : 365 };
+}
+
+/** One protocol's feature row: [1, log10 TVL, growth, log10(age + offset), category dummies...]. */
+export function featureRow(p: SnapshotProtocol, asOf: string, spec: FeatureSpec, model: ModelConstants = MODEL): number[] {
+  const age = ageForModel(p, asOf, spec.medianAgeDays, model);
+  const row = [1, Math.log10(p.tvl_usd), growthValue(p, model), Math.log10(age + model.age_offset_days)];
+  for (const c of spec.categories) row.push(p.category === c || (p.category === null && c === '(none)') ? 1 : 0);
+  return row;
+}
+
+function dot(a: number[], b: number[]): number {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i]! * b[i]!;
+  return s;
+}
+
+/** Solve A x = b by Gaussian elimination with partial pivoting; A is square, b matches. */
+export function solveLinear(aIn: number[][], bIn: number[]): number[] {
+  const n = bIn.length;
+  const a = aIn.map((row) => [...row]);
+  const b = [...bIn];
+  for (let col = 0; col < n; col++) {
+    let pivot = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(a[r]![col]!) > Math.abs(a[pivot]![col]!)) pivot = r;
+    if (Math.abs(a[pivot]![col]!) < 1e-12) a[pivot]![col] = 1e-12;
+    if (pivot !== col) {
+      [a[col], a[pivot]] = [a[pivot]!, a[col]!];
+      [b[col], b[pivot]] = [b[pivot]!, b[col]!];
+    }
+    for (let r = col + 1; r < n; r++) {
+      const f = a[r]![col]! / a[col]![col]!;
+      for (let c = col; c < n; c++) a[r]![c]! -= f * a[col]![c]!;
+      b[r]! -= f * b[col]!;
+    }
+  }
+  const x = new Array<number>(n).fill(0);
+  for (let r = n - 1; r >= 0; r--) {
+    let s = b[r]!;
+    for (let c = r + 1; c < n; c++) s -= a[r]![c]! * x[c]!;
+    x[r] = s / a[r]![r]!;
+  }
+  return x;
+}
+
+/** Ridge (lambda, intercept unpenalised) + Huber IRLS fit of log10(mcap) on the feature rows. */
+export function fitMulti(rows: SnapshotProtocol[], asOf: string, model: ModelConstants = MODEL): { coefficients: number[]; spec: FeatureSpec; r2: number } {
+  const spec = featureSpec(rows, asOf, model);
+  const x = rows.map((p) => featureRow(p, asOf, spec, model));
+  const y = rows.map((p) => Math.log10(p.mcap_usd as number));
+  const k = x[0]!.length;
+  const penalty = new Array<number>(k).fill(model.ridge_lambda);
+  penalty[0] = 0;
+  const solveWeighted = (w: number[]): number[] => {
+    const a: number[][] = Array.from({ length: k }, () => new Array<number>(k).fill(0));
+    const b: number[] = new Array<number>(k).fill(0);
+    for (let i = 0; i < x.length; i++) {
+      const wi = w[i]!;
+      for (let r = 0; r < k; r++) {
+        b[r]! += wi * x[i]![r]! * y[i]!;
+        for (let c = 0; c < k; c++) a[r]![c]! += wi * x[i]![r]! * x[i]![c]!;
+      }
+    }
+    for (let r = 0; r < k; r++) a[r]![r]! += penalty[r]!;
+    return solveLinear(a, b);
+  };
+  let coef = solveWeighted(new Array<number>(x.length).fill(1));
+  for (let iter = 0; iter < model.huber_max_iters; iter++) {
+    const resid = x.map((row, i) => y[i]! - dot(row, coef));
+    const centre = medianOf(resid);
+    const mad = medianOf(resid.map((r) => Math.abs(r - centre))) * 1.4826;
+    const scale = mad > 0 ? mad : 1;
+    const cut = model.huber_k * scale;
+    const w = resid.map((r) => {
+      const d = Math.abs(r - centre);
+      return d <= cut ? 1 : cut / d;
+    });
+    const next = solveWeighted(w);
+    const delta = Math.max(...next.map((v, i) => Math.abs(v - coef[i]!)));
+    coef = next;
+    if (delta < 1e-10) break;
+  }
+  const mean = y.reduce((a, b) => a + b, 0) / y.length;
+  let ssRes = 0;
+  let ssTot = 0;
+  for (let i = 0; i < y.length; i++) {
+    ssRes += (y[i]! - dot(x[i]!, coef)) ** 2;
+    ssTot += (y[i]! - mean) ** 2;
+  }
+  return { coefficients: coef, spec, r2: ssTot === 0 ? 0 : 1 - ssRes / ssTot };
+}
+
+/** The fitted log10 market cap for one protocol under a fit. */
+export function predictLog(p: SnapshotProtocol, asOf: string, fit: { coefficients: number[]; spec: FeatureSpec }, model: ModelConstants = MODEL): number {
+  return dot(featureRow(p, asOf, fit.spec, model), fit.coefficients);
 }
 
 /** The fitted base, the multipliers and the implied value one protocol gets. */
 export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
-  fit: { alpha: number; beta: number },
+  fit: { coefficients: number[]; spec: FeatureSpec; r2: number },
   medians: { overall: number; byCategory: Map<string, { median: number; n: number }> },
-  model: ModelConstants,
+  model: ModelConstants = MODEL,
 ): { implied: number; fittedBase: number; catAdj: number; catMedianRatio: number | null; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
   const age = ageDays(asOf, protocol.listed_at);
-  const rawGrowth = finite(protocol.change_7d, 0);
-  const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
-  const growthMult = 1 + (growthPct / 100) * model.growth_weight;
-  const ageForModel = age ?? model.unknown_age_days;
-  const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const { adjustment: catAdj, medianRatio: catMedianRatio } = categoryAdjustment(protocol, medians, model);
-  const fittedBase = Math.pow(10, fit.alpha + fit.beta * Math.log10(protocol.tvl_usd));
+  const growthPct = growthValue(protocol, model) * 100;
+  const ageUsed = ageForModel(protocol, asOf, fit.spec.medianAgeDays, model);
+  const catIndex = fit.spec.categories.indexOf(protocol.category ?? '(none)');
+  const catCoef = catIndex >= 0 ? fit.coefficients[4 + catIndex]! : 0;
+  const catAdj = Math.pow(10, catCoef);
+  const growthMult = Math.pow(10, fit.coefficients[2]! * growthValue(protocol, model));
+  const maturityMult = Math.pow(10, fit.coefficients[3]! * Math.log10(ageUsed + model.age_offset_days));
+  const fittedBase = Math.pow(10, fit.coefficients[0]! + fit.coefficients[1]! * Math.log10(protocol.tvl_usd));
+  const entry = medians.byCategory.get(protocol.category ?? '(none)');
+  const catMedianRatio = entry === undefined ? null : entry.median;
   const implied = Math.max(1, Math.round(fittedBase * catAdj * growthMult * maturityMult));
   return { implied, fittedBase, catAdj, catMedianRatio, growthPct, growthMult, maturityMult, age };
 }
 
 /** Deterministic 5-fold cross-validation of the fitted model on the comps. */
-export function validateModel(comps: SnapshotProtocol[], asOf: string, model: ModelConstants): Validation {
+export function validateModel(comps: SnapshotProtocol[], asOf: string, model: ModelConstants = MODEL): Validation {
   const folds = 5;
   const perFold: { fold: number; n: number; median_abs_pct_error: number }[] = [];
   const allErrors: number[] = [];
   for (let f = 0; f < folds; f++) {
     const test = comps.filter((_, i) => i % folds === f);
     const train = comps.filter((_, i) => i % folds !== f);
-    const fit = fitLogLog(train);
+    const fit = fitMulti(train, asOf, model);
     const medians = categoryMedians(train);
     const errors = test.map((p) => {
       const { implied } = impliedValue(p, asOf, fit, medians, model);
@@ -458,7 +573,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(
   snapshot: Snapshot,
-  fit: { alpha: number; beta: number },
+  fit: { coefficients: number[]; spec: FeatureSpec; r2: number },
   medians: { overall: number; byCategory: Map<string, { median: number; n: number }> },
   model: ModelConstants = MODEL,
 ): BoardRow[] {
@@ -553,7 +668,7 @@ export function radarRow(row: BoardRow): RadarRow {
 /** Everything the dashboard renders, from the snapshot. */
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const comps = compsOf(snapshot);
-  const fit = fitLogLog(comps);
+  const fit = fitMulti(comps, snapshot.as_of, model);
   const medians = categoryMedians(comps);
   const validation = validateModel(comps, snapshot.as_of, model);
   const board = buildBoard(snapshot, fit, medians, model);
@@ -566,14 +681,17 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   let topCategory = '(none)';
   let topCategoryCount = 0;
   for (const [c, n] of catCounts) if (n > topCategoryCount || (n === topCategoryCount && c < topCategory)) { topCategory = c; topCategoryCount = n; }
-  const categoryAdjustments: CategoryAdjustment[] = [...medians.byCategory.entries()]
-    .filter(([, v]) => v.n >= model.cat_min_comps)
-    .map(([category, v]) => ({
-      category,
-      n: v.n,
-      median_ratio: round4(v.median),
-      adjustment: round4(Math.min(model.cat_adj_max, Math.max(model.cat_adj_min, v.median / medians.overall))),
-    }))
+  const categoryAdjustments: CategoryAdjustment[] = fit.spec.categories
+    .map((category) => {
+      const entry = medians.byCategory.get(category);
+      const coef = fit.coefficients[4 + fit.spec.categories.indexOf(category)]!;
+      return {
+        category,
+        n: entry?.n ?? 0,
+        median_ratio: round4(entry?.median ?? 0),
+        adjustment: round4(Math.pow(10, coef)),
+      };
+    })
     .sort((a, b) => b.adjustment - a.adjustment || a.category.localeCompare(b.category));
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -586,8 +704,16 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     early_size: early,
     live_size: live.length,
     fit: {
-      alpha: round4(fit.alpha),
-      beta: round4(fit.beta),
+      intercept: round4(fit.coefficients[0]!),
+      coef_log_tvl: round4(fit.coefficients[1]!),
+      coef_growth: round4(fit.coefficients[2]!),
+      coef_log_age: round4(fit.coefficients[3]!),
+      category_coefs: fit.spec.categories.map((category) => {
+        const coef = fit.coefficients[4 + fit.spec.categories.indexOf(category)]!;
+        const entry = medians.byCategory.get(category);
+        return { category, n: entry?.n ?? 0, coef: round4(coef), effect: round4(Math.pow(10, coef)) };
+      }),
+      median_age_days: fit.spec.medianAgeDays,
       r2: round4(fit.r2),
       n: comps.length,
       overall_median_ratio: round4(medians.overall),

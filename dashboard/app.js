@@ -1,4 +1,4 @@
-// Token Radar's dashboard, radar-2. It reads window.RADAR (written beside dashboard/ by main.ts)
+// Token Radar's dashboard, radar-3. It reads window.RADAR (written beside dashboard/ by main.ts)
 // and renders the ranked board, the comps-fitted model with its out-of-sample validation, a
 // filterable table, a per-protocol detail view with the model's own breakdown and the farm plan,
 // and the live-token set aside. No network: every byte it shows is in data.js.
@@ -101,7 +101,7 @@
 
   function header() {
     return el('header', { class: 'top' },
-      el('div', { class: 'brand' }, el('span', { class: 'mark' }), el('span', { text: 'Token Radar' }), el('small', { text: 'radar-2' })),
+      el('div', { class: 'brand' }, el('span', { class: 'mark' }), el('span', { text: 'Token Radar' }), el('small', { text: 'radar-3' })),
       el('div', { class: 'top-meta' },
         el('span', { text: 'Snapshot ' + DATA.as_of }),
         el('span', { text: 'DefiLlama protocol index' }),
@@ -126,7 +126,7 @@
         kpi('Board rows', String(DATA.board_size), DATA.early_size + ' early rows below the floor'),
         kpi('Median implied value', fmtUsd(DATA.median_implied_usd), 'across the board'),
         kpi('Comps fitted', String(DATA.fit.n), 'live-token protocols'),
-        kpi('Fit R²', DATA.fit.r2.toFixed(2), 'log(mcap) on log(TVL)'),
+        kpi('Fit R²', DATA.fit.r2.toFixed(2), 'log(mcap) on TVL, growth, age, category'),
         kpi('Out-of-sample error', (v.median_abs_pct_error * 100).toFixed(0) + '%', '5-fold CV, median abs. error')
       )
     );
@@ -154,9 +154,9 @@
       el('h2', { text: 'The model, fitted and tested on this snapshot' }),
       el('p', { class: 'sub', text: 'Implied value is fitted from the ' + f.n + ' live-token protocols that carry both a market cap and a TVL. No protocol name is special-cased, and no row is hand-picked.' }),
       el('div', { class: 'formula' },
-        'implied = round( 10^(' + f.alpha + ' + ' + f.beta + ' x log10(tvl_usd)) x category_adj x (1 + clamp(change_7d, -60, 120) / 100 x 0.5) x (0.6 + min(age_days, 1095) / 1095 x 0.4) )'
+        'implied = round( 10^(' + f.intercept + ' + ' + f.coef_log_tvl + ' x log10(tvl_usd) + ' + f.coef_growth + ' x growth + ' + f.coef_log_age + ' x log10(age_days + 30) + category_coef) )'
       ),
-      el('p', { class: 'sub', text: 'The fit: log10(market cap) = ' + f.alpha + ' + ' + f.beta + ' x log10(TVL), R² ' + f.r2.toFixed(2) + ' on ' + f.n + ' comps. Category adjustment is the category\u2019s median market-cap/TVL over the overall median ' + f.overall_median_ratio.toFixed(3) + ', clamped to 0.5–2.0, for categories with 3 or more comps. Age is the time since the protocol was first listed; an unlisted age uses 365 days.' }),
+      el('p', { class: 'sub', text: 'The fit: log10(market cap) = ' + f.intercept + ' + ' + f.coef_log_tvl + ' x log10(TVL) + ' + f.coef_growth + ' x growth + ' + f.coef_log_age + ' x log10(age + 30) + a category effect, R² ' + f.r2.toFixed(2) + ' on ' + f.n + ' comps. Growth is change_7d / 100, clipped to -0.6..1.2. The fit is ridge-regularised (lambda 3) and Huber-robust, so the few comps whose market-cap/TVL ratio is an extreme outlier do not drag it around. Age is the time since the protocol was first listed; an unlisted age uses the comps\u2019 median age, ' + f.median_age_days + ' days. Category effects are fitted dummies for categories with 3 or more comps; the median mcap/TVL beside each is descriptive only.' }),
       el('div', { class: 'valid-grid' },
         el('div', null,
           el('h3', { text: 'Out-of-sample validation (5-fold, by slug order)' }),
@@ -167,10 +167,10 @@
           )
         ),
         el('div', null,
-          el('h3', { text: 'Category adjustments (largest first)' }),
-          el('p', { class: 'sub', text: 'A category whose tokens trade rich to TVL lifts its pre-token peers; one whose tokens trade cheap pulls them down.' }),
+          el('h3', { text: 'Category effects (largest first)' }),
+          el('p', { class: 'sub', text: 'A category whose tokens trade rich to TVL lifts its pre-token peers; one whose tokens trade cheap pulls them down. The effect is the fitted dummy, as a multiplier.' }),
           el('table', null,
-            el('thead', null, el('tr', null, el('th', { text: 'Category' }), el('th', { text: 'Comps' }), el('th', { text: 'Median mcap/TVL' }), el('th', { text: 'Adjustment' }))),
+            el('thead', null, el('tr', null, el('th', { text: 'Category' }), el('th', { text: 'Comps' }), el('th', { text: 'Median mcap/TVL' }), el('th', { text: 'Effect' }))),
             el('tbody', null, catRows)
           )
         )
@@ -323,10 +323,10 @@
         el('div', null, el('span', { text: 'TVL' }), el('b', { class: 'num', text: fmtUsd(row.tvl_usd) })),
         el('div', null, el('span', { text: 'Seven-day growth' }), el('b', { class: 'num', text: fmtPctRaw(row.change_7d) })),
         el('div', null, el('span', { text: 'Age with no token' }), el('b', { class: 'num', text: fmtAge(row.age_days) })),
-        el('div', null, el('span', { text: 'Fitted base (comps fit)' }), el('b', { class: 'num', text: fmtUsd(row.fitted_base_usd) })),
-        el('div', null, el('span', { text: 'Category adjustment' }), el('b', { class: 'num', text: 'x' + row.category_adjustment.toFixed(2) })),
-        el('div', null, el('span', { text: 'Growth multiplier' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
-        el('div', null, el('span', { text: 'Maturity multiplier' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
+        el('div', null, el('span', { text: 'Fitted base (TVL only)' }), el('b', { class: 'num', text: fmtUsd(row.fitted_base_usd) })),
+        el('div', null, el('span', { text: 'Category effect' }), el('b', { class: 'num', text: 'x' + row.category_adjustment.toFixed(2) })),
+        el('div', null, el('span', { text: 'Growth effect' }), el('b', { class: 'num', text: String(row.growth_multiplier) })),
+        el('div', null, el('span', { text: 'Age effect' }), el('b', { class: 'num', text: String(row.maturity_multiplier) })),
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. This is an estimate from the snapshot\u2019s own figures, not a price, and it says the protocol records no token — not that it has none.' })
@@ -355,7 +355,7 @@
     shell.appendChild(validationPanel());
     shell.appendChild(controls());
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
-    shell.appendChild(el('p', { class: 'note', text: 'Method: implied value is fitted on this snapshot\u2019s live-token comparables (log market cap on log TVL, category-calibrated) and validated out of sample; the board separates protocols whose token already trades from those still to come. “No token” means the record carries none. Farm plans are a reader\u2019s guide, not advice, and claiming costs nothing but gas — never pay to claim.' }));
+    shell.appendChild(el('p', { class: 'note', text: 'Method: implied value is fitted on this snapshot\u2019s live-token comparables (log market cap on log TVL, 7-day growth, age and category, ridge + Huber-robust) and validated out of sample; the board separates protocols whose token already trades from those still to come. “No token” means the record carries none. Farm plans are a reader\u2019s guide, not advice, and claiming costs nothing but gas — never pay to claim.' }));
     app.appendChild(shell);
     app.setAttribute('aria-busy', 'false');
     if (!dialog.isConnected) app.appendChild(dialog);

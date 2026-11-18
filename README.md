@@ -6,19 +6,18 @@
 
 A token launch radar: 240 pre-token protocols ranked by an implied value that is **fitted from this snapshot's own live-token comparables**, validated out of sample, with a costed farm plan for every row. Built by an AI agent for make.fun's "Build the best token launch radar" bounty ($1,325 in USDC).
 
-## The model (radar-2)
+## The model (radar-3)
 
-Implied value follows from the snapshot's own figures — TVL, seven-day growth, and how long a protocol has run with no token — never from a hardcoded list of names:
+Implied value follows from the snapshot's own figures — TVL, seven-day growth, age, and category — fitted as one multi-variable regression on the snapshot's own live-token comparables, never from a hardcoded list of names:
 
 ```
-implied = round( 10^(alpha + beta x log10(tvl_usd)) x category_adj
-                 x (1 + clamp(change_7d, -60, 120) / 100 x 0.5)
-                 x (0.6 + min(age_days, 1095) / 1095 x 0.4) )
+log10(mcap) = 3.1051 + 0.4834 x log10(tvl_usd) - 0.2389 x growth
+              + 0.0753 x log10(age_days + 30) + category_coef
 ```
 
-- **Comps fit:** `log10(market cap) = alpha + beta x log10(TVL)`, least squares on the 128 live-token protocols that carry both a market cap and a TVL. Fitted at run time from the snapshot the program reads.
-- **Category adjustment:** each category's median market-cap/TVL over the overall median, clamped to 0.5–2.0, for categories with 3 or more comps. A category whose tokens trade rich to TVL lifts its pre-token peers.
-- **Validation:** deterministic 5-fold cross-validation over the comps (fold = index % 5 on slug order). Each fold is fitted on the other four and scored on its held-out protocols. The dashboard reports the median absolute error, the share within 50%, and the share within 2x — and the per-fold errors. The market is noisy; the model is a ranking signal, not a price.
+- **Comps fit:** ridge-regularised (lambda 3, intercept unpenalised) + Huber-robust (k = 1.345 x MAD) least squares on the 128 live-token protocols that carry both a market cap and a TVL. Fitted at run time from the snapshot the program reads. Growth is `change_7d / 100`, clipped to -0.6..1.2; age is days since `listed_at`, unknown ages use the comps' median age (1,000 days); one dummy per category with 3 or more comps. Huber downweights the extreme market-cap/TVL outliers (ratios in this snapshot run from 0.0003 to 400) without deleting any comp.
+- **Fit quality, honestly:** R² **0.26** on all 128 comps (radar-2's TVL-only fit was 0.19). The market is very noisy — even with all four signals the fit explains only about a quarter of the variance, and the growth coefficient comes out slightly negative, which is what the comps say, not what intuition would guess.
+- **Validation:** deterministic 5-fold cross-validation over the comps (fold = index % 5 on slug order), refitting the whole pipeline per fold. Median absolute error **83.6%** (radar-2: 89%), 25% of comps within 50%, 66% within 2x. Per-fold medians: 80.6%, 93.8%, 118.2%, 89.5%, 82.1%. The model is a ranking signal, not a price.
 
 ## The board
 
