@@ -58,7 +58,6 @@ export interface Snapshot {
 
 /** The model's constants, as the dashboard states them. */
 export interface ModelConstants {
-  growth_weight: number;
   growth_floor: number;
   growth_cap: number;
   age_offset_days: number;
@@ -69,7 +68,6 @@ export interface ModelConstants {
 }
 
 export const MODEL: ModelConstants = {
-  growth_weight: 0.5,
   growth_floor: -60,
   growth_cap: 120,
   age_offset_days: 30,
