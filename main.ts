@@ -81,6 +81,20 @@ for (const name of shots) {
     process.stderr.write(`token radar: screenshots/${name}: a name is letters, digits and . _ -, 1 to 128 characters\n`);
     process.exit(1);
   }
+  // Fail fast on a screenshot the gate would refuse: a whole PNG or JPEG, at most 512 KiB each.
+  // buildDossier would refuse it too, but this names the file and the reason before the dossier step.
+  const shotPath = join(out, 'screenshots', name);
+  const bytes = readFileSync(shotPath);
+  const isPng = bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
+  const isJpeg = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  if (!isPng && !isJpeg) {
+    process.stderr.write(`token radar: screenshots/${name}: not a whole PNG or JPEG\n`);
+    process.exit(1);
+  }
+  if (bytes.length > SCREENSHOT_CAPS.max_bytes) {
+    process.stderr.write(`token radar: screenshots/${name}: ${bytes.length} bytes, over the ${SCREENSHOT_CAPS.max_bytes} cap\n`);
+    process.exit(1);
+  }
 }
 
 // The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
